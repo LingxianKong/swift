@@ -50,6 +50,10 @@ if swiftclient.__version__ < '2.6.0':
 # indentify original large object uploaded with S3 API in RGW.
 OLD_HASH_HEADER = 'x-object-meta-old-hash'
 
+# The custom header we specify when creating object in Swift, to help us
+# indentify original mtime of DLO in RGW.
+OLD_MTIME_HEADER = 'x-object-meta-old-mtime'
+
 # A simple regex that matches large object hash which uploaded with S3
 # multi-part upload API.
 HASH_PATTERN = re.compile('\w+-\w+')
@@ -132,14 +136,17 @@ def check_migrate_object(container_name, src_object, src_header,
                 tgt_header.get(OLD_HASH_HEADER, '') == src_object['hash']):
         return False
 
-    # For DLO, ignore the check if content-length is equal. Because the etag
-    # will be different.
+    # For DLO, skip the migration if the mtime has not changed.
     if src_header.get('x-object-manifest', False):
         origin_length = int(src_header['content-length'])
         tgt_length = int(tgt_header['content-length'])
+        origin_mtime = src_header['x-object-meta-mtime']
+        tgt_mtime = tgt_header.get(OLD_MTIME_HEADER, '')
 
-        if origin_length == tgt_length:
+        if origin_length == tgt_length and origin_mtime == tgt_mtime:
             return False
+
+        return True
 
     # For normal object etag check.
     if tgt_header['etag'] == src_object['hash']:
@@ -174,6 +181,8 @@ def migrate_DLO(container_name, src_object, src_head, src_srvclient,
                 tgt_srvclient):
     """Migrate dynamic large object."""
     headers = ['x-object-manifest:%s' % src_head['x-object-manifest']]
+    headers.append(
+        '%s:%s' % (OLD_MTIME_HEADER, src_head['x-object-meta-mtime']))
 
     upload_iter = tgt_srvclient.upload(
         container_name,
@@ -391,6 +400,7 @@ def migrate_container(container_name, src_srvclient, tgt_srvclient, content):
                     migrate_DLO(container_name, src_data, src_ohead,
                                 src_srvclient, tgt_srvclient)
                 elif src_ohead.get('x-static-large-object', False):
+                    # This is not gonna happen.
                     migrate_SLO(container_name, src_data, src_ohead,
                                 src_srvclient, tgt_srvclient)
                 else:
@@ -543,7 +553,6 @@ def _get_service_clients(tenant, args, key):
 def worker(id, tenants, lock, stats, tenant_usage, args, key):
     file_name = ("swift-migrate-worker-%02d.output" % id)
     max_size_info = {'tenant': '', 'container': '', 'object': '', 'size': 0}
-    tenant_usage_map = {}
 
     # Remove the log file first.
     if os.path.exists(file_name):

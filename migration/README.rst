@@ -34,6 +34,10 @@ Currently (and for the entire migration exercise) this will be RGW.
     * It's recommended running this script on API (or Swift Proxy) node in each
       region.
     * python-swiftclient and python-keystoneclient need to be installed.
+    * Please ensure there is enough disk space(maximum of
+      concurrency*max_single_object_size) in /tmp on the host the script is
+      running, because the script will download large object to that folder,
+      then delete it after uploading the object to Swift.
 
 2. Before actual moving objects from RGW to Swift, you can see the overview of
    object storage statistics in RGW::
