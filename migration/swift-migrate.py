@@ -1,10 +1,5 @@
 #!/usr/bin/env python
 #
-# swift-migrate.py:
-#
-# Author:
-# mark.kirkwood@catalyst.net.nz
-#
 # License:
 # Apache License, Version 2.0 (same as Openstack)
 #
