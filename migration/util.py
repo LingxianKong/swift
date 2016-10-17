@@ -1,4 +1,18 @@
-import itertools
+# Copyright 2016 Catalyst IT Ltd
+# Author: lingxian.kong@catalyst.net.nz
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
 import math
 
 from keystoneclient.v2_0 import client as k_client
@@ -12,7 +26,7 @@ def _chunks(arr, m):
     return [arr[i:i + n] for i in range(0, len(arr), n)]
 
 
-def _keystone_connect(user_name, tenant_name, key, insecure, auth_version,
+def keystone_connect(user_name, tenant_name, key, insecure, auth_version,
                       auth_url, options={}):
     keycon = k_client.Client(
         username=user_name,
@@ -50,6 +64,18 @@ def _get_tenants_group(tenants, args, multiprocess=False):
         actual_tnames = args.include_tenants
     elif args.exclude_tenants:
         actual_tnames = set(tenants_map.keys()) - set(args.exclude_tenants)
+    elif args.include_file:
+        with open(args.include_file) as f:
+            actual_tnames = f.read().splitlines()
+
+            invalid_tenants = set(actual_tnames) - set(tenants_map.keys())
+            if invalid_tenants:
+                print('Invalid tenants: %s' % invalid_tenants)
+                exit(1)
+    elif args.exclude_file:
+        with open(args.exclude_file) as f:
+            exclude_tnames = f.read().splitlines()
+            actual_tnames = set(tenants_map.keys()) - set(exclude_tnames)
 
     actual_tenants = [tenants_map[name] for name in actual_tnames]
 
@@ -61,49 +87,35 @@ def _get_tenants_group(tenants, args, multiprocess=False):
     return tenants_group
 
 
-def _check_tenant_membership(keycon, username, rolename, tenants):
-    """Ensure user has role in every tenant."""
-    for user in keycon.users.list():
+def get_tenant_group(args, keyconn, multiprocess=False):
+    tenants = [t for t in keyconn.tenants.list() if t.enabled]
+    tenants_group = _get_tenants_group(tenants, args, multiprocess)
+
+    return tenants_group
+
+
+def get_user_role(args, keyconn, username, rolename):
+    for user in keyconn.users.list():
         if user.name == username:
             break
     else:
         raise RuntimeError('failed to find own user!')
 
-    for member in keycon.roles.list():
-        if member.name == rolename:
+    for role in keyconn.roles.list():
+        if role.name == rolename:
             break
     else:
         raise RuntimeError('failed to find member role!')
 
-    for tenant in tenants:
-        print "...checking tenant: " + tenant.name + ", user: " + username
-        is_ok = False
-        for role in keycon.roles.roles_for_user(user, tenant):
-            if role.name == 'admin' or role.name == rolename:
-                is_ok = True
-                break
-        if is_ok == False:
-            print "......adding " + rolename + " role for this tenant"
-            keycon.roles.add_user_role(user, member, tenant)
+    return (user, role)
 
 
-def check_user_access(args, key, multiprocess=False):
-    tenant_name = args.user.split(':')[0]
-    user_name = args.user.split(':')[1]
-
-    keycon = _keystone_connect(
-        user_name, tenant_name, key, True, 2, args.authurl,
-        # {'tenant_name': tenant_name, 'region_name': args.region},
-    )
-
-    tenants = [t for t in keycon.tenants.list() if t.enabled]
-    tenants_group = _get_tenants_group(tenants, args, multiprocess)
-
-    print("checking user has %s role in each tenant." % args.role)
-    _check_tenant_membership(keycon, user_name, args.role,
-                             itertools.chain.from_iterable(tenants_group))
-
-    return tenants_group
+def check_tenant_access(args, keyconn, user, tenant, role):
+    for r in keyconn.roles.roles_for_user(user, tenant):
+        if r.name == 'admin' or r.name == args.role:
+            break
+    else:
+        keycon.roles.add_user_role(user, role, tenant)
 
 
 def get_connection(tenant_name, user_name, key, auth_url, options={}):
@@ -179,7 +191,7 @@ def rename_container(conn, name, suffix):
     try:
         conn.head_container(new_name)
         print('\t\tContainer: %s already exists.' % new_name)
-    except ClientException:
+    except swiftclient.ClientException:
         print('\t\tCreating new container: %s' % new_name)
 
         # Copy acls if it is defined.
@@ -198,10 +210,17 @@ def rename_container(conn, name, suffix):
     print('\t\tCopying objects from %s to %s' % (name, new_name))
 
     for o_name in obj_names:
-        old_obj_path = '/%s/%s' % (name, o_name)
+        try:
+            conn.head_object(new_name, o_name)
+            print('\t\t\tObject: %s already exists.' % o_name)
+        except swiftclient.ClientException:
+            print('\t\t\tCopying object: %s' % o_name)
 
-        conn.put_object(new_name, o_name, None, content_length=0,
-                        headers={'X-Copy-From': old_obj_path})
-
-    print('\t\tDeleting container: %s' % name)
-    delete_container(conn, name)
+            old_obj_path = '/%s/%s' % (name, o_name)
+            conn.put_object(new_name, o_name, None, content_length=0,
+                            headers={'X-Copy-From': old_obj_path})
+    #     finally:
+    #         conn.delete_object(name, o_name)
+    #
+    # print('\t\tDeleting old container: %s' % name)
+    # conn.delete_container(name)

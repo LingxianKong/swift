@@ -1,28 +1,17 @@
-#!/usr/bin/env python
+# Copyright 2016 Catalyst IT Ltd
+# Author: lingxian.kong@catalyst.net.nz
 #
-# swift-migrate.py:
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
 #
-# Author:
-# mark.kirkwood@catalyst.net.nz
+#         http://www.apache.org/licenses/LICENSE-2.0
 #
-# License:
-# Apache License, Version 2.0 (same as Openstack)
-#
-# Desc:
-# Migrates containers and objects from one object system (Swift
-# or RGW based) to another (Swift based).
-#
-# Assumptions/requirements:
-# - both systems use the same keystone database for auth
-# - target system is Swift based
-# - user running the migration is admin in primary tenancy
-
-# Design overview:
-# - add self to every tenancy with supplied role
-# - Divide tenancies according to process number configuration, loop every tenancy in separated process.
-# -- connect to src and (optionally) target object storage systems as tenant
-# -- get container and object stats for src
-# -- copy containers and objects src to target if in copy mode
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
 
 import argparse
 from collections import Iterable
@@ -31,8 +20,10 @@ import json
 import multiprocessing
 import os
 import re
+import sys
 import tempfile
 import time
+import traceback
 
 import six
 import swiftclient
@@ -51,8 +42,8 @@ if swiftclient.__version__ < '2.6.0':
 OLD_HASH_HEADER = 'x-object-meta-old-hash'
 
 # The custom header we specify when creating object in Swift, to help us
-# indentify original mtime of DLO in RGW.
-OLD_MTIME_HEADER = 'x-object-meta-old-mtime'
+# indentify original timestamp of DLO in RGW.
+OLD_TIMESTAMP_HEADER = 'x-object-meta-old-timestamp'
 
 # A simple regex that matches large object hash which uploaded with S3
 # multi-part upload API.
@@ -63,9 +54,51 @@ GB_SPLIT = 2147483648
 
 
 def _print_object_detail(src_srvclient, tenant_name, cname, content,
-                         max_size_info):
+                         max_size_info, object=None):
+    if object:
+        stat_res = list(
+            src_srvclient.stat(container=cname, objects=[object])
+        )[0]
+
+        if not stat_res['success']:
+            raise Exception(stat_res["error"])
+
+        header = stat_res['headers']
+        item = stat_res['items']
+        if int(item[4][1]) > int(max_size_info['size']):
+            max_size_info.update({
+                'tenant': tenant_name,
+                'size': int(item[4][1]),
+                'container': cname,
+                'object': object
+            })
+
+        prefix = ('[large-object] '
+                  if HASH_PATTERN.match(header['etag'])
+                  else '')
+        content.append(
+            '            %s%s\t%s' % (
+                prefix,
+                object,
+                int(item[4][1]),
+            )
+        )
+        content.append('            ....headers: %s' % header)
+
+        return
+
     for page in src_srvclient.list(container=cname):
         if page["success"]:
+            object_names = [o['name'] for o in page["listing"]]
+            objects = list(
+                src_srvclient.stat(
+                    container=cname,
+                    objects=object_names)
+            )
+            object_mapping = {}
+            for o in objects:
+                object_mapping[o['object']] = o
+
             for item in page["listing"]:
                 if item['bytes'] > max_size_info['size']:
                     max_size_info.update({
@@ -79,9 +112,7 @@ def _print_object_detail(src_srvclient, tenant_name, cname, content,
                           if HASH_PATTERN.match(item['hash'])
                           else '')
 
-                obj_stat = list(
-                    src_srvclient.stat(container=cname, objects=[item['name']])
-                )[0]
+                obj_stat = object_mapping[item['name']]
                 obj_header = obj_stat['headers']
 
                 content.append(
@@ -96,8 +127,156 @@ def _print_object_detail(src_srvclient, tenant_name, cname, content,
             raise Exception(page["error"])
 
 
-def stat_tenant(id, content, src_srvclient, verbose, max_size_info,
-                tenant_name):
+def print_info(elapsed, stats, tenant_usage, moved_stats):
+    # Print total object storage information.
+    print 70 * '='
+    print "Elapsed time: {0}s".format(elapsed)
+    print(
+        "Total containers: %s, objects: %s, size: %.3fT" % (
+            stats['cons'],
+            stats['objs'],
+            float(stats['bytes']) / (1024 * 1024 * 1024 * 1024)
+        )
+    )
+
+    # Print tenant usage in descending order.
+    sorted_tenant_usage = sorted(
+        tenant_usage.items(), key=lambda d: d[1], reverse=True)
+    print('Tenants have objects:')
+    for name, usage in sorted_tenant_usage:
+        if usage > 0:
+            print('%35s: %.6fG' % (name, float(usage) / (1024 * 1024 * 1024)))
+
+    # Print total moved objects.
+    print 70 * '='
+    total_moved_count = 0
+    total_moved_bytes = 0
+    for tenant, moved in six.iteritems(moved_stats):
+        total_moved_count += moved['moved_objects']
+        total_moved_bytes += moved['moved_bytes']
+
+    print "Total moved objects:"
+    print(
+        "\tobjects: %s, size: %.3fG" % (
+            total_moved_count,
+            float(total_moved_bytes) / (1024 * 1024 * 1024)
+        )
+    )
+
+    # Print moved objects per tenant.
+    print('Moved objects per tenant:')
+    for tenant, moved in six.iteritems(moved_stats):
+        if moved['moved_bytes'] > 0:
+            print(
+                '\t%s: objects: %s, size: %s' %
+                (tenant, moved['moved_objects'], moved['moved_bytes'])
+            )
+
+
+def get_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-u", "--user",
+        help="Combination of admin tenant name and user name. Example: "
+             "openstack:objectmonitor"
+    )
+    parser.add_argument(
+        "-r", "--region",
+        help="Region in which the migration needs to happen"
+    )
+    parser.add_argument("--rgw-host", help="API host name of RGW")
+    parser.add_argument(
+        "--rgw-port",
+        help="RGW service port on API host, Default: 8443",
+        default="8443"
+    )
+    parser.add_argument("-x", "--host", help="Swift proxy host name")
+    parser.add_argument(
+        "-p", "--port",
+        help="Swift proxy port, Default: 8843",
+        default="8843"
+    )
+    parser.add_argument("-a", "--authurl", help="Keystone auth url")
+    parser.add_argument(
+        "-m", "--role",
+        help="Name of the role that is added to each tenant for resource "
+             "access. Default: admin",
+        default="admin"
+    )
+    parser.add_argument(
+        "-t", "--act",
+        choices=['stat', 'copy'],
+        default="stat",
+        help="Action to be performed. 'stat' means only get statistic of "
+             "object storage without migration, 'copy' means doing migration. "
+             "Default: stat"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action='store_true',
+        help="verbose",
+    )
+    parser.add_argument(
+        "-c", "--concurrency",
+        type=int,
+        help="Number of processes need to be running. Default: 1",
+        default=1
+    )
+    parser.add_argument(
+        "--container",
+        help="Container name needs to migrate.",
+    )
+    parser.add_argument(
+        "--object",
+        help="Object name needs to migrate.",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '-i', '--include-tenants', nargs='*',
+        help="List of tenants to include in migration, delimited "
+             "by whitespace."
+    )
+    group.add_argument(
+        '-e', '--exclude-tenants', nargs='*',
+        help="List of tenants to exclude in migration, delimited "
+             "by whitespace."
+    )
+    group.add_argument(
+        '--include-file',
+        help="A file that contains a list of project names that should be "
+             "included."
+    )
+    group.add_argument(
+        '--exclude-file',
+        help="A file that contains a list of project names that should be "
+             "excluded."
+    )
+
+    return parser
+
+
+def stat_tenant(id, content, src_srvclient, max_size_info, tenant_name,
+                container=None, object=None):
+    if container:
+        print('...[%02d] Processing container %s' % (id, container))
+
+        stat_res = src_srvclient.stat(container=container)
+        if stat_res['success']:
+            header = stat_res['headers']
+            content.append(
+                '........{0}, objects: {1}, bytes: {2}'.format(
+                    container, header['x-container-object-count'],
+                    header['x-container-bytes-used'])
+            )
+
+            if object:
+                _print_object_detail(src_srvclient, tenant_name, container,
+                                     content, max_size_info, object=object)
+
+            return
+        else:
+            raise Exception(stat_res["error"])
+
     for page in src_srvclient.list():
         if page["success"]:
             for container in page["listing"]:
@@ -110,83 +289,88 @@ def stat_tenant(id, content, src_srvclient, verbose, max_size_info,
                 )
 
                 # Print objects details.
-                if verbose:
-                    _print_object_detail(src_srvclient, tenant_name, cname,
-                                         content, max_size_info)
+                _print_object_detail(src_srvclient, tenant_name, cname,
+                                     content, max_size_info)
         else:
             raise Exception(page["error"])
 
 
-def check_migrate_object(container_name, src_object, src_header,
-                         tgt_srvclient):
+def check_migrate_object(container_name, src_header, tgt_obj):
     """Check whether we should migrate src object or not.
 
     Return True if migration is needed, otherwise return False.
     """
-    tgt_obj = list(tgt_srvclient.stat(container=container_name,
-                                      objects=[src_object['name']]))[0]
-
     if not tgt_obj['success']:
         return True
 
     tgt_header = tgt_obj['headers']
+    src_etag = src_header['etag']
+    origin_timestamp = float(src_header['x-timestamp'])
+    tgt_timestamp = float(tgt_header['x-timestamp'])
 
     # For multi-part large object hash check.
-    if (HASH_PATTERN.match(src_object['hash']) and
-                tgt_header.get(OLD_HASH_HEADER, '') == src_object['hash']):
+    if (HASH_PATTERN.match(src_etag) and
+            tgt_header.get(OLD_HASH_HEADER, '') == src_etag):
         return False
 
-    # For DLO, skip the migration if the mtime has not changed.
+    # For DLO, skip the migration if the timestamp has not changed.
     if src_header.get('x-object-manifest', False):
         origin_length = int(src_header['content-length'])
         tgt_length = int(tgt_header['content-length'])
-        origin_mtime = src_header['x-object-meta-mtime']
-        tgt_mtime = tgt_header.get(OLD_MTIME_HEADER, '')
+        tgt_timestamp = tgt_header.get(OLD_TIMESTAMP_HEADER, '0')
 
-        if origin_length == tgt_length and origin_mtime == tgt_mtime:
+        # Do not move object if they have the same length and latest version
+        # on Swift side.
+        if origin_length == tgt_length and origin_timestamp <= tgt_timestamp:
             return False
 
         return True
 
-    # For normal object etag check.
-    if tgt_header['etag'] == src_object['hash']:
+    # For normal object etag check. For some reason, the hash in
+    # 'container_list' output has '\x00' in the end.
+    if tgt_header['etag'] == src_etag.replace('\x00', ''):
+        return False
+    # Do not move object if the lasted version is on Swift side
+    elif origin_timestamp <= tgt_timestamp:
         return False
 
     return True
 
 
-def check_migrate_after(container_name, src_object, tgt_srvclient, is_dlo,
-                        content):
+def check_migrate_after(container_name, object_name, src_etag, tgt_srvclient,
+                        is_dlo, content):
     content.append("             ..ok..checking")
 
     tgt_obj = list(
         tgt_srvclient.stat(
             container=container_name,
-            objects=[src_object['name']])
+            objects=[object_name])
     )[0]
 
     if not tgt_obj['success']:
         raise Exception(tgt_obj['error'])
 
     if not is_dlo:
+        # For some reason, the hash in 'container_list' output has '\x00' in
+        # the end.
         tgt_header = tgt_obj['headers']
         if (not tgt_header.get(OLD_HASH_HEADER, False) and
-                    tgt_header['etag'] != src_object['hash']):
+                tgt_header['etag'] != src_etag.replace('\x00', '')):
             raise Exception('src and target objects have different hashes.')
 
     content.append("             ..ok")
 
 
-def migrate_DLO(container_name, src_object, src_head, src_srvclient,
+def migrate_DLO(container_name, object_name, src_head, src_srvclient,
                 tgt_srvclient):
     """Migrate dynamic large object."""
     headers = ['x-object-manifest:%s' % src_head['x-object-manifest']]
     headers.append(
-        '%s:%s' % (OLD_MTIME_HEADER, src_head['x-object-meta-mtime']))
+        '%s:%s' % (OLD_TIMESTAMP_HEADER, src_head['x-timestamp']))
 
     upload_iter = tgt_srvclient.upload(
         container_name,
-        [SwiftUploadObject(None, object_name=src_object['name'])],
+        [SwiftUploadObject(None, object_name=object_name)],
         options={'header': headers}
     )
 
@@ -195,7 +379,7 @@ def migrate_DLO(container_name, src_object, src_head, src_srvclient,
             raise Exception(r['error'])
 
 
-def migrate_SLO(container_name, src_object, src_head, src_srvclient,
+def migrate_SLO(container_name, object_name, src_head, src_srvclient,
                 tgt_srvclient):
     """Migrate static large object.
 
@@ -211,7 +395,7 @@ def migrate_SLO(container_name, src_object, src_head, src_srvclient,
     with tempfile.NamedTemporaryFile() as temp_file:
         down_res_iter = src_srvclient.download(
             container=container_name,
-            objects=[src_object['name']],
+            objects=[object_name],
             options={'out_file': temp_file.name, 'checksum': False}
         )
 
@@ -222,7 +406,7 @@ def migrate_SLO(container_name, src_object, src_head, src_srvclient,
                 upload_iter = tgt_srvclient.upload(
                     container_name,
                     [SwiftUploadObject(temp_file.name,
-                                       object_name=src_object['name'])],
+                                       object_name=object_name)],
                     options={'header': headers}
                 )
                 for r in upload_iter:
@@ -290,10 +474,10 @@ def get_object_user_meta(object_header):
     return user_meta_list
 
 
-def migrate_object(container_name, src_object, src_head, src_srvclient,
-                   tgt_srvclient, content):
+def migrate_object(container_name, object_name, src_byte, src_head,
+                   src_srvclient, tgt_srvclient, content):
     """Migrate normal object."""
-    single_large_object = True if int(src_object['bytes']) > GB_5 else False
+    single_large_object = True if int(src_byte) > GB_5 else False
 
     # Get user's customized object metadata, format:
     # X-<type>-Meta-<key>: <value>
@@ -301,18 +485,17 @@ def migrate_object(container_name, src_object, src_head, src_srvclient,
     user_meta = get_object_user_meta(src_head)
 
     header_list = []
-    if HASH_PATTERN.match(src_object['hash']):
-        header_list.append('%s:%s' % (OLD_HASH_HEADER, src_object['hash']))
+    if HASH_PATTERN.match(src_head['etag']):
+        header_list.append('%s:%s' % (OLD_HASH_HEADER, src_head['etag']))
     header_list.extend(user_meta)
 
     if single_large_object:
-        content.append('            ..[large object] '
-                       'download...split...upload')
+        content.append('            ..[large object]download...split...upload')
 
         with tempfile.NamedTemporaryFile() as temp_file:
             down_res = list(src_srvclient.download(
                 container=container_name,
-                objects=[src_object['name']],
+                objects=[object_name],
                 options={'out_file': '-', 'checksum': False}
             ))[0]
             contents = down_res['contents']
@@ -329,7 +512,7 @@ def migrate_object(container_name, src_object, src_head, src_srvclient,
             upload_iter = tgt_srvclient.upload(
                 container_name,
                 [SwiftUploadObject(temp_file.name,
-                                   object_name=src_object['name'])],
+                                   object_name=object_name)],
                 options={'header': header_list,
                          'segment_size': GB_SPLIT,
                          'checksum': False}
@@ -344,7 +527,7 @@ def migrate_object(container_name, src_object, src_head, src_srvclient,
         down_res = list(
             src_srvclient.download(
                 container=container_name,
-                objects=[src_object['name']],
+                objects=[object_name],
                 options={'out_file': '-', 'checksum': False}
             )
         )[0]
@@ -360,7 +543,7 @@ def migrate_object(container_name, src_object, src_head, src_srvclient,
         upload_iter = tgt_srvclient.upload(
             container_name,
             [SwiftUploadObject(readalbe_content,
-                               object_name=src_object['name'])],
+                               object_name=object_name)],
             options={'header': header_list, 'checksum': False}
         )
 
@@ -369,53 +552,105 @@ def migrate_object(container_name, src_object, src_head, src_srvclient,
                 raise Exception(r['error'])
 
 
-def migrate_container(container_name, src_srvclient, tgt_srvclient, content):
-    for page in src_srvclient.list(container=container_name):
+def migrate_container(container_name, src_srvclient, tgt_srvclient, content,
+                      object=None, moved_stats=None):
+    if object:
+        list_res = [
+            {
+                'success': True,
+                'listing': [{'name': object}]
+            }
+        ]
+    else:
+        list_res = src_srvclient.list(container=container_name)
+
+    for page in list_res:
         if not page["success"]:
             raise Exception(page["error"])
 
-        for src_data in page["listing"]:
-            src_obj = list(
-                src_srvclient.stat(
-                    container=container_name,
-                    objects=[src_data['name']])
-            )[0]
-            src_ohead = src_obj['headers']
+        # Get all the objects status by bulk query to save API calls.
+        object_names = [o['name'] for o in page["listing"]]
+        objects = list(
+            src_srvclient.stat(
+                container=container_name,
+                objects=object_names)
+        )
+        object_mapping = {}
+        for o in objects:
+            object_mapping[o['object']] = o
 
+        # Do the same for target object storage.
+        tgt_objects = list(
+            tgt_srvclient.stat(
+                container=container_name,
+                objects=object_names)
+        )
+        tgt_object_mapping = {}
+        for o in tgt_objects:
+            tgt_object_mapping[o['object']] = o
+
+        for src_data in page["listing"]:
+            object_name = src_data['name']
+            src_obj = object_mapping[object_name]
+            tgt_obj = tgt_object_mapping[object_name]
+            src_ohead = src_obj['headers']
+            src_byte = src_obj['items'][4][1]
             is_dlo = src_ohead.get('x-object-manifest', False)
 
             # First, check if migration is needed.
-            if not check_migrate_object(container_name, src_data, src_ohead,
-                                        tgt_srvclient):
+            if not check_migrate_object(container_name, src_ohead, tgt_obj):
                 content.append(
-                    '            existing object: %s' % src_data['name'])
+                    '            existing object: %s' % object_name)
                 continue
 
             content.append(
                 '            creating object: %s,\tbytes: %s' %
-                (src_data['name'], src_data['bytes']))
+                (object_name, src_byte))
 
             try:
                 if is_dlo:
-                    migrate_DLO(container_name, src_data, src_ohead,
+                    migrate_DLO(container_name, object_name, src_ohead,
                                 src_srvclient, tgt_srvclient)
                 elif src_ohead.get('x-static-large-object', False):
                     # This is not gonna happen.
-                    migrate_SLO(container_name, src_data, src_ohead,
+                    migrate_SLO(container_name, object_name, src_ohead,
                                 src_srvclient, tgt_srvclient)
                 else:
-                    migrate_object(container_name, src_data, src_ohead,
-                                   src_srvclient, tgt_srvclient, content)
+                    migrate_object(container_name, object_name, src_byte,
+                                   src_ohead, src_srvclient, tgt_srvclient,
+                                   content)
 
                 # Check hash and etag after uploading, don't check DLO.
-                check_migrate_after(container_name, src_data, tgt_srvclient,
-                                    is_dlo, content)
-            except Exception as e:
-                content.append("             ..failed. Reason: %s" % str(e))
+                check_migrate_after(
+                    container_name, object_name, src_ohead['etag'],
+                    tgt_srvclient, is_dlo, content
+                )
+
+                # Update moved stats
+                moved_stats['moved_objects'] += 1
+                if not is_dlo:
+                    moved_stats['moved_bytes'] += int(src_byte)
+            except Exception:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                lines = traceback.format_exception(exc_type, exc_value,
+                                                   exc_traceback)
+                err_msg = ''.join(line for line in lines)
+                content.append("             ..failed. Reason: %s" % err_msg)
 
 
-def migrate_tenant(id, content, src_srvclient, tgt_srvclient):
-    for page in src_srvclient.list():
+def migrate_tenant(id, content, src_srvclient, tgt_srvclient, container=None,
+                   object=None, moved_stats=None):
+    if container:
+        list_res = [
+            {
+                'success': True,
+                'listing': [{'name': container}]
+            }
+        ]
+    else:
+        list_res = src_srvclient.list()
+
+    for page in list_res:
         if page["success"]:
             for container in page["listing"]:
                 cname = container['name']
@@ -448,7 +683,8 @@ def migrate_tenant(id, content, src_srvclient, tgt_srvclient):
                 else:
                     content.append('........existing container: %s' % cname)
 
-                migrate_container(cname, src_srvclient, tgt_srvclient, content)
+                migrate_container(cname, src_srvclient, tgt_srvclient, content,
+                                  object=object, moved_stats=moved_stats)
 
         else:
             raise Exception(page["error"])
@@ -506,30 +742,20 @@ def _get_connections(tenant, args, key):
 def _get_service_clients(tenant, args, key):
     tgt_srvclient = None
 
-    if args.default_storage == 'rgw':
-        # Get RGW service client from Keystone.
-        src_srvclient = util.get_service_client(
-            tenant.name,
-            args.user.split(':')[1],
-            key,
-            args.authurl,
-            {'os_region_name': args.region}
-        )
+    storurl = 'https://%s:%s/swift/v1' % (args.rgw_host, args.rgw_port)
+    src_srvclient = util.get_service_client(
+        tenant.name,
+        args.user.split(':')[1],
+        key,
+        args.authurl,
+        {'os_region_name': args.region, 'os_storage_url': storurl}
+    )
 
-        if args.act == 'copy':
-            storurl = 'https://%s:%s/v1/AUTH_%s' % (
-                args.host, args.port, tenant.id)
+    if args.act == 'copy':
+        storurl = 'https://%s:%s/v1/AUTH_%s' % (
+            args.host, args.port, tenant.id)
 
-            tgt_srvclient = util.get_service_client(
-                tenant.name,
-                args.user.split(':')[1],
-                key,
-                args.authurl,
-                {'os_region_name': args.region, 'os_storage_url': storurl}
-            )
-    else:
-        storurl = 'https://%s:%s/swift/v1' % (args.host, args.port)
-        src_srvclient = util.get_service_client(
+        tgt_srvclient = util.get_service_client(
             tenant.name,
             args.user.split(':')[1],
             key,
@@ -537,20 +763,11 @@ def _get_service_clients(tenant, args, key):
             {'os_region_name': args.region, 'os_storage_url': storurl}
         )
 
-        if args.act == 'copy':
-            # Get Swift service clent from Keystone.
-            tgt_srvclient = util.get_service_client(
-                tenant.name,
-                args.user.split(':')[1],
-                key,
-                args.authurl,
-                {'os_region_name': args.region}
-            )
-
     return src_srvclient, tgt_srvclient
 
 
-def worker(id, tenants, lock, stats, tenant_usage, args, key):
+def worker(id, tenants, lock, stats, moved_stats, tenant_usage, args, key,
+           user, role, keyconn):
     file_name = ("swift-migrate-worker-%02d.output" % id)
     max_size_info = {'tenant': '', 'container': '', 'object': '', 'size': 0}
 
@@ -560,6 +777,9 @@ def worker(id, tenants, lock, stats, tenant_usage, args, key):
 
     for tenant in tenants:
         content = []
+        moved_stats[tenant.name] = {'moved_objects': 0, 'moved_bytes': 0}
+
+        util.check_tenant_access(args, keyconn, user, tenant, role)
 
         try:
             print('[%02d] processing tenant: %s' % (id, tenant.name))
@@ -573,7 +793,7 @@ def worker(id, tenants, lock, stats, tenant_usage, args, key):
                 account = accout_stat['headers']
 
                 content.append(
-                    "......containers: {0},\tobjects: {1},\tbytes: {2}".format(
+                    "......containers: {0}, objects: {1}, bytes: {2}".format(
                         account['x-account-container-count'],
                         account['x-account-object-count'],
                         account['x-account-bytes-used']
@@ -583,24 +803,37 @@ def worker(id, tenants, lock, stats, tenant_usage, args, key):
                     account['x-account-bytes-used']
                 )
 
-                with lock:
+                if lock:
+                    with lock:
+                        stats['cons'] += int(
+                            account['x-account-container-count'])
+                        stats['objs'] += int(account['x-account-object-count'])
+                        stats['bytes'] += int(account['x-account-bytes-used'])
+                else:
                     stats['cons'] += int(account['x-account-container-count'])
                     stats['objs'] += int(account['x-account-object-count'])
                     stats['bytes'] += int(account['x-account-bytes-used'])
 
-                if args.act == 'stat':
-                    stat_tenant(id, content, src_srvclient, args.verbose,
-                                max_size_info, tenant.name)
-
-                if args.act == 'copy':
-                    with tgt_srvclient:
-                        migrate_tenant(id, content, src_srvclient,
-                                       tgt_srvclient)
+                if int(account['x-account-container-count']) > 0:
+                    if args.act == 'stat' and (args.verbose or args.object):
+                        stat_tenant(id, content, src_srvclient, max_size_info,
+                                    tenant.name, container=args.container,
+                                    object=args.object)
+                    if args.act == 'copy':
+                        with tgt_srvclient:
+                            migrate_tenant(
+                                id, content, src_srvclient, tgt_srvclient,
+                                container=args.container, object=args.object,
+                                moved_stats=moved_stats[tenant.name]
+                            )
         except Exception as e:
             print(
                 '[%02d] error occured when processing tenant: %s. error: %s' %
                 (id, tenant.name, str(e))
             )
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            traceback.print_exception(exc_type, exc_value, exc_traceback,
+                                      limit=2, file=sys.stdout)
         finally:
             with open(file_name, 'a') as file:
                 file.write('\n'.join(content))
@@ -613,107 +846,64 @@ def worker(id, tenants, lock, stats, tenant_usage, args, key):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-u", "--user",
-        help="Combination of admin tenant name and user name. Example: "
-             "openstack:objectmonitor"
-    )
-    parser.add_argument(
-        "-r", "--region",
-        help="Region in which the migration needs to happen"
-    )
-    parser.add_argument("-x", "--host", help="Swift proxy host name")
-    parser.add_argument(
-        "-p", "--port",
-        help="Swift proxy port, Default: 8843",
-        default="8843"
-    )
-    parser.add_argument("-a", "--authurl", help="Keystone auth url")
-    parser.add_argument(
-        "-m", "--role",
-        help="Name of the role that is added to each tenant for resource "
-             "access. Default: admin",
-        default="admin"
-    )
-    parser.add_argument(
-        "-t", "--act",
-        choices=['stat', 'copy'],
-        default="stat",
-        help="Action to be performed. 'stat' means only get statistic of "
-             "object storage without migration, 'copy' means doing migration. "
-             "Default: stat"
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action='store_true',
-        help="verbose",
-    )
-    parser.add_argument(
-        "-c", "--concurrency",
-        type=int,
-        help="Number of processes need to be running. Default: number of "
-             "CPUs in the host that the script is running on.",
-        default=multiprocessing.cpu_count()
-    )
-    parser.add_argument(
-        "-s",
-        "--default-storage",
-        choices=['rgw', 'swift'],
-        default="rgw",
-        help="Default object storage service in Keytone. Default: rgw."
-    )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        '-i', '--include-tenants', nargs='*',
-        help="List of tenants to include in migration, delimited "
-             "by whitespace."
-    )
-    group.add_argument(
-        '-e', '--exclude-tenants', nargs='*',
-        help="List of tenants to exclude in migration, delimited "
-             "by whitespace."
-    )
+    parser = get_parser()
     args = parser.parse_args()
 
     key = getpass.getpass('enter password for ' + args.user + ': ')
+    tenant_name = args.user.split(':')[0]
+    user_name = args.user.split(':')[1]
 
-    tenants_group = util.check_user_access(args, key, multiprocess=True)
+    keyconn = util.keystone_connect(
+        user_name, tenant_name, key, True, 2, args.authurl,
+    )
+    user, role = util.get_user_role(args, keyconn, user_name, args.role)
+    tenants_group = util.get_tenant_group(args, keyconn, multiprocess=True)
+
+    if (args.container and
+            (len(tenants_group) != 1 or len(tenants_group[0]) != 1)):
+        print('Error: Only one tenant can be specifed when specifying '
+              'container to migrate.')
+        sys.exit(1)
+    if args.object and not args.container:
+        print('Error: Container must be specified together with object.')
+        sys.exit(1)
 
     print("\nStart migration in %s processes. The output of each process is "
           "contained in separated file under the script's directory.\n"
           % len(tenants_group))
 
-    jobs = []
-    lock = multiprocessing.Lock()
-    manager = multiprocessing.Manager()
-    stats = manager.dict({'cons': 0, 'objs': 0, 'bytes': 0})
-    tenant_usage = manager.dict()
-
+    stats = {'cons': 0, 'objs': 0, 'bytes': 0}
+    moved_stats = {}
+    tenant_usage = {}
     elapsed = time.time()
-    for i in range(len(tenants_group)):
-        p = multiprocessing.Process(
-            target=worker,
-            args=(i, tenants_group[i], lock, stats, tenant_usage, args, key)
-        )
-        jobs.append(p)
-        p.start()
-    for p in jobs:
-        p.join()
-    elapsed = time.time() - elapsed
 
-    print 70 * '='
-    print "elapsed: {0} s".format(elapsed)
-    print "total containers: {0}\tobjects: {1}\tbytes: {2}".format(
-        stats['cons'], stats['objs'], stats['bytes'])
-    print 70 * '='
-    # Print top 10 tenant usage in descending order.
-    sorted_tenant_usage = sorted(
-        tenant_usage.items(), key=lambda d: d[1], reverse=True)
-    print('TOP 10 Tenants:')
-    msg = []
-    for name, usage in sorted_tenant_usage[:10]:
-        print('%s: %s' % (name, usage))
+    if len(tenants_group) > 1:
+        jobs = []
+        lock = multiprocessing.Lock()
+        manager = multiprocessing.Manager()
+        stats = manager.dict({'cons': 0, 'objs': 0, 'bytes': 0})
+        moved_stats = manager.dict()
+        tenant_usage = manager.dict()
+
+        for i in range(len(tenants_group)):
+            p = multiprocessing.Process(
+                target=worker,
+                args=(i, tenants_group[i], lock, stats, moved_stats,
+                      tenant_usage, args, key, user, role, keyconn)
+            )
+            jobs.append(p)
+            p.start()
+        for p in jobs:
+            p.join()
+    else:
+        worker(
+            0, tenants_group[0], None, stats, moved_stats, tenant_usage,
+            args, key, user, role, keyconn
+        )
+
+    elapsed = time.time() - elapsed
+    print_info(elapsed, stats, tenant_usage, moved_stats)
+
 
 if __name__ == '__main__':
     main()

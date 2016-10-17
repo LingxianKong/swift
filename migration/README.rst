@@ -1,6 +1,17 @@
 Helper Scripts for Object Storage Migration From Ceph Rados Gateway to Swift
 ============================================================================
 
+Prerequisite
+~~~~~~~~~~~~
+The motivation of writing those scirpts comes from the internal requirement of
+Catalyst Cloud. We deployed Rados Gateway to provide object storage service to
+customers of our OpenStack based public cloud in two separated regions. As
+Swift becomes more stable and mature in OpenStack community, we decided to
+switch to use Swift as object storage service. At the same time, we expanded
+the number of regions to three, so customers could benefit from high
+availability and unified interface with eventual consistency provided by Swift
+multi-region duplication.
+
 Check duplicate container name between regions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Before we do migration from RGW to Swift, the first thing we need to check is
@@ -9,7 +20,7 @@ will lead to customers data loss.
 
 You can use the following command for the check::
 
-    python swift-check-duplicate.py openstack:objectmonitor \
+    $ python swift-check-duplicate.py openstack:objectmonitor \
            https://api.cloud.catalyst.net.nz:5000/v2.0 \
            --action report
 
@@ -37,36 +48,34 @@ Currently (and for the entire migration exercise) this will be RGW.
     * Please ensure there is enough disk space(maximum of
       concurrency*max_single_object_size) in /tmp on the host the script is
       running, because the script will download large object to that folder,
-      then delete it after uploading the object to Swift.
+      then delete it after upload.
 
 2. Before actual moving objects from RGW to Swift, you can see the overview of
    object storage statistics in RGW::
 
-    $ python -W ignore swift-migrate.py -u openstack:objectmonitor \
-             -r test-1 -a https://api.ostst.wgtn.cat-it.co.nz:5000/v2.0 、
-             -c 2 | tee output
+    $ python swift-migrate.py --user openstack:objectmonitor \
+             --region <region_name> --authurl https://api.cloud.catalyst.net.nz:5000/v2.0 \
+             --rgw-host <rgw-api-host> --act stat
 
-   You will see logs both in screen and output file, in the end, you can see
-   the total number of containers/objects/bytes and the top 10 tenants of
-   object storage usage in your system(RGW in this case).
+   In the end of output, you can see summary information, such as the total
+   number of containers/objects/bytes and the top 10 tenants of object storage
+   usage in your system(RGW in this case).
 
    At the meanwhile, you can see total number of containers/objects/bytes of
-   each tenant in each process's log file.
+   each tenant in each process's log file in current directory.
 
    More details could be shown if you specify -v in the command line.
 
 3. Start to migrate object from RGW to Swift::
 
-    python -W ignore swift-migrate.py -u openstack:objectmonitor \
-             -r test-1 -a https://api.ostst.wgtn.cat-it.co.nz:5000/v2.0 \
-             -t copy -x api.ostst.wgtn.cat-it.co.nz -c 2 | tee output
+    $ python swift-migrate.py --user openstack:objectmonitor \
+             --region test-1 --authurl https://api.cloud.catalyst.net.nz:5000/v2.0 \
+             --act copy --host <swift-proxy-host> --rgw-host <rgw-api-host>
 
-   * Multiple processes will be created for the migration job, the default
-     concurrency number is processor number of the host the script is running
-     on. Tenants will be split evenly among all the processes.
    * The migration time will depends on how many tenants in the environment and
      how many objects and how big of them in each tenant.
    * You can specify the tenant names you want to include or exclude.
+   * You can specify the exact container or object that to be migrated.
    * Containers and objects will be created in Swift if not exist or changed
      since last running.
    * For object with size less than 5G that users uploaded using S3 multi-part
@@ -75,8 +84,8 @@ Currently (and for the entire migration exercise) this will be RGW.
      key: `x-object-meta-old-hash`
    * When migrating single large object (with size > 5G)from RGW to Swift, the
      object will be split into multiple segments(with size of each equals 2G by
-     default) and uploaded as dynamic large object.
-   * The script will check the Etag of every object after migration.
+     default) and uploaded as dynamic large object in Swift.
+   * Static large object is not supported in RGW 0.9.4.x.
 
 4. Now, all you need to do is wait and pray :-)
 
@@ -92,9 +101,8 @@ identify them.
 You can use the following command for the check::
 
     python swift-check-deleted.py openstack:objectmonitor \
-            https://api.ostst.wgtn.cat-it.co.nz:5000/v2.0 \
-            api.ostst.wgtn.cat-it.co.nz \
-            --env preprod \
+            https://api.cloud.catalyst.net.nz:5000/v2.0 \
+            <swift-proxy-host> \
             --action report
 
 If you decide to delete the containers/objects instead of just print messages,

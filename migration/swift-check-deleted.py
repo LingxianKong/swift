@@ -21,7 +21,7 @@ from swiftclient.service import SwiftError
 
 import util
 
-ENV_REGIONS = {'preprod': ['test-1'], 'prod': ['nz-por-1', 'nz_wlg_2']}
+ENV_REGIONS = {'preprod': ['test-1'], 'prod': ['nz_wlg_2', 'nz-por-1']}
 
 
 def check_objects(swift_client, actual_client, cname, objects,
@@ -32,7 +32,10 @@ def check_objects(swift_client, actual_client, cname, objects,
 
     for res in res_iter:
         if not res['success']:
-            print('.........FOUND nonexistent object: %s' % res['object'])
+            print(
+                '.........FOUND nonexistent object: %s. error: %s' %
+                (res['object'], res['error'])
+            )
             objs_delete.append(res['object'])
 
     if action == 'delete' and objs_delete:
@@ -82,11 +85,13 @@ def check_container(swift_client, rgw_clients, action):
                       action)
 
 
-def check_deleted(tenants, args, key):
+def check_deleted(tenants, args, key, keyconn, user, role):
     user_name = args.user.split(':')[1]
 
     for tenant in tenants:
         print('Checking tenant: %s' % tenant.name)
+
+        util.check_tenant_access(args, keyconn, user, tenant, role)
 
         # Request to Swift from different regions has the same result.
         storurl = ('https://%s:%s/v1/AUTH_%s' %
@@ -157,15 +162,31 @@ def main():
         nargs='*',
         help="List of tenants to exclude in checking, delimited by whitespace."
     )
+    group.add_argument(
+        '--include-file',
+        help="A file that contains a list of project names that should be "
+             "included."
+    )
+    group.add_argument(
+        '--exclude-file',
+        help="A file that contains a list of project names that should be "
+             "excluded."
+    )
     args = parser.parse_args()
 
     key = getpass.getpass('enter password for ' + args.user + ': ')
+    tenant_name = args.user.split(':')[0]
+    user_name = args.user.split(':')[1]
 
-    tenants = util.check_user_access(args, key, multiprocess=False)
+    keyconn = util.keystone_connect(
+        user_name, tenant_name, key, True, 2, args.authurl,
+    )
+    user, role = util.get_user_role(args, keyconn, user_name, args.role)
+    tenants_group = util.get_tenant_group(args, keyconn, multiprocess=False)
 
     print('=' * 60)
 
-    check_deleted(tenants[0], args, key)
+    check_deleted(tenants_group[0], args, key, keyconn, user, role)
 
 
 if __name__ == '__main__':
